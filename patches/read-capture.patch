@@ -1,0 +1,334 @@
+--- /dev/null
++++ b/src/Plugins/Tia/ReadCapture.php
+@@ -0,0 +1,281 @@
++<?php
++
++declare(strict_types=1);
++
++namespace Pest\Plugins\Tia;
++
++use Closure;
++use RuntimeException;
++
++/**
++ * Records project files a test opens for reading, so TIA links them like executed files.
++ *
++ * Coverage only sees executed code: a test that asserts on a file's text gets no edge.
++ * While a test records, this wrapper stands in for `file://`, passes every operation to
++ * the native wrapper, and links each file opened for reading. Includes are skipped,
++ * because coverage already records the files that run.
++ *
++ * @internal
++ */
++final class ReadCapture
++{
++    private const string PROTOCOL = 'file';
++
++    /**
++     * PHP sets this flag on `stream_open()` for include/require.
++     */
++    private const int STREAM_OPEN_FOR_INCLUDE = 0x00000080;
++
++    /**
++     * @var resource|null
++     */
++    public $context;
++
++    /**
++     * @var resource
++     */
++    private mixed $resource;
++
++    private static ?Recorder $recorder = null;
++
++    public static function start(Recorder $recorder): void
++    {
++        if (self::$recorder !== null) {
++            return;
++        }
++
++        self::$recorder = $recorder;
++
++        self::enable();
++    }
++
++    public static function stop(): void
++    {
++        if (self::$recorder === null) {
++            return;
++        }
++
++        self::$recorder = null;
++
++        self::disable();
++    }
++
++    private static function enable(): void
++    {
++        stream_wrapper_unregister(self::PROTOCOL);
++        stream_wrapper_register(self::PROTOCOL, self::class);
++    }
++
++    private static function disable(): void
++    {
++        stream_wrapper_restore(self::PROTOCOL);
++    }
++
++    public function stream_open(string $path, string $mode, int $options, ?string &$openedPath): bool
++    {
++        $resource = $this->withOriginalWrapper(function () use ($path, $mode, $options) {
++            $resource = ($options & STREAM_REPORT_ERRORS) !== 0
++                ? fopen($path, $mode, ($options & STREAM_USE_PATH) !== 0, $this->context)
++                : @fopen($path, $mode, ($options & STREAM_USE_PATH) !== 0, $this->context);
++
++            if (is_resource($resource) && $this->isRead($mode, $options)) {
++                self::$recorder?->linkRead($path);
++            }
++
++            return $resource;
++        });
++
++        if (! is_resource($resource)) {
++            return false;
++        }
++
++        $this->resource = $resource;
++
++        return true;
++    }
++
++    private function isRead(string $mode, int $options): bool
++    {
++        if (($options & self::STREAM_OPEN_FOR_INCLUDE) !== 0) {
++            return false;
++        }
++
++        return str_contains($mode, 'r') || str_contains($mode, '+');
++    }
++
++    public function dir_closedir(): bool
++    {
++        closedir($this->resource);
++
++        return true;
++    }
++
++    public function dir_opendir(string $path, int $options): bool
++    {
++        $resource = $this->withOriginalWrapper(fn () => opendir($path, $this->context));
++
++        if (! is_resource($resource)) {
++            return false;
++        }
++
++        $this->resource = $resource;
++
++        return true;
++    }
++
++    public function dir_readdir(): string|false
++    {
++        return readdir($this->resource);
++    }
++
++    public function dir_rewinddir(): bool
++    {
++        rewinddir($this->resource);
++
++        return true;
++    }
++
++    public function mkdir(string $path, int $mode, int $options): bool
++    {
++        return $this->withOriginalWrapper(fn (): bool => mkdir($path, $mode, ($options & STREAM_MKDIR_RECURSIVE) !== 0, $this->context));
++    }
++
++    public function rename(string $pathFrom, string $pathTo): bool
++    {
++        return $this->withOriginalWrapper(fn (): bool => rename($pathFrom, $pathTo, $this->context));
++    }
++
++    public function rmdir(string $path, int $options): bool
++    {
++        return $this->withOriginalWrapper(fn (): bool => rmdir($path, $this->context));
++    }
++
++    /**
++     * @return resource
++     */
++    public function stream_cast(int $castAs): mixed
++    {
++        return $this->resource;
++    }
++
++    public function stream_close(): void
++    {
++        fclose($this->resource);
++    }
++
++    public function stream_eof(): bool
++    {
++        return feof($this->resource);
++    }
++
++    public function stream_flush(): bool
++    {
++        return fflush($this->resource);
++    }
++
++    public function stream_lock(int $operation): bool
++    {
++        if ($operation === 0) {
++            $operation = LOCK_EX;
++        }
++
++        return flock($this->resource, $operation);
++    }
++
++    public function stream_metadata(string $path, int $option, mixed $value): bool
++    {
++        return $this->withOriginalWrapper(fn (): bool => match ($option) {
++            STREAM_META_TOUCH => empty($value) ? touch($path) : touch($path, $value[0], $value[1]), // @phpstan-ignore-line
++            STREAM_META_OWNER_NAME, STREAM_META_OWNER => chown($path, $value), // @phpstan-ignore-line
++            STREAM_META_GROUP_NAME, STREAM_META_GROUP => chgrp($path, $value), // @phpstan-ignore-line
++            STREAM_META_ACCESS => chmod($path, $value), // @phpstan-ignore-line
++            default => throw new RuntimeException('Unknown stream_metadata option'),
++        });
++    }
++
++    /**
++     * @param  int<1, max>  $count
++     */
++    public function stream_read(int $count): string|false
++    {
++        return fread($this->resource, $count);
++    }
++
++    public function stream_seek(int $offset, int $whence = SEEK_SET): bool
++    {
++        return fseek($this->resource, $offset, $whence) === 0;
++    }
++
++    public function stream_set_option(int $option, int $arg1, ?int $arg2): bool
++    {
++        return match ($option) {
++            STREAM_OPTION_BLOCKING => stream_set_blocking($this->resource, (bool) $arg1),
++            STREAM_OPTION_READ_TIMEOUT => stream_set_timeout($this->resource, $arg1, (int) $arg2),
++            STREAM_OPTION_WRITE_BUFFER => stream_set_write_buffer($this->resource, $arg1) === 0,
++            STREAM_OPTION_READ_BUFFER => stream_set_read_buffer($this->resource, $arg1) === 0,
++            default => false,
++        };
++    }
++
++    /**
++     * @return array<int|string, int>|false
++     */
++    public function stream_stat(): array|false
++    {
++        return fstat($this->resource);
++    }
++
++    public function stream_tell(): int|false
++    {
++        return ftell($this->resource);
++    }
++
++    /**
++     * @param  int<0, max>  $newSize
++     */
++    public function stream_truncate(int $newSize): bool
++    {
++        return ftruncate($this->resource, $newSize);
++    }
++
++    public function stream_write(string $data): int|false
++    {
++        return fwrite($this->resource, $data);
++    }
++
++    public function unlink(string $path): bool
++    {
++        return $this->withOriginalWrapper(fn (): bool => unlink($path, $this->context));
++    }
++
++    /**
++     * @return array<int|string, int>|false
++     */
++    public function url_stat(string $path, int $flags): array|false
++    {
++        return $this->withOriginalWrapper(function () use ($path, $flags): array|false {
++            if (($flags & STREAM_URL_STAT_QUIET) !== 0 && ! file_exists($path)) {
++                return false;
++            }
++
++            return ($flags & STREAM_URL_STAT_LINK) !== 0 ? @lstat($path) : @stat($path);
++        });
++    }
++
++    /**
++     * @template T
++     *
++     * @param  Closure(): T  $callback
++     * @return T
++     */
++    private function withOriginalWrapper(Closure $callback): mixed
++    {
++        self::disable();
++
++        try {
++            return $callback();
++        } finally {
++            self::enable();
++        }
++    }
++}
+--- a/src/Plugins/Tia/Recorder.php
++++ b/src/Plugins/Tia/Recorder.php
+@@ -103,6 +103,8 @@
+ 
+         $this->currentTestFile = $file;
+ 
++        ReadCapture::start($this);
++
+         if ($this->classUsesDatabase($className)) {
+             $this->perTestUsesDatabase[$file] = true;
+         }
+@@ -127,6 +129,8 @@
+             return;
+         }
+ 
++        ReadCapture::stop();
++
+         if (! $this->captureCoverage || ! $this->driverAvailable()) {
+             $this->currentTestFile = null;
+ 
+@@ -189,6 +193,20 @@
+         $this->perTestFiles[$this->currentTestFile][$sourceFile] = true;
+     }
+ 
++    /**
++     * Links a file the current test opened for reading, when it is project source.
++     */
++    public function linkRead(string $path): void
++    {
++        $real = realpath($path);
++
++        if ($real === false || ! is_file($real) || ! $this->sourceScope()->contains($real)) {
++            return;
++        }
++
++        $this->linkSource($real);
++    }
++
+     private function classUsesDatabase(string $className): bool
+     {
+         if (array_key_exists($className, $this->classUsesDatabaseCache)) {
+@@ -374,6 +392,8 @@
+ 
+     public function reset(): void
+     {
++        ReadCapture::stop();
++
+         $this->currentTestFile = null;
+         $this->perTestFiles = [];
+         $this->perTestTables = [];
