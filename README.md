@@ -114,12 +114,12 @@ if (! isset($this->fileIds[$rel])) {
 
 `patches/read-capture.patch` (against v5.3.4) records the files a test reads:
 
-- `src/Plugins/Tia/ReadCapture.php` (new): a `file://` stream wrapper, registered only while a test records. It passes every operation to PHP's native wrapper, and links each file opened for reading through `Recorder::linkSource()`, the hook `BladeEdges` uses. Includes are skipped, because coverage already records executed files, and so are write-only opens. `pestphp/pest-plugin-mutate` overrides `file://` the same way (`Pest\Mutate\Support\StreamWrapper`).
+- `src/Plugins/Tia/ReadCapture.php` (new): a `file://` stream wrapper, registered only while a test records. It passes every operation to PHP's native wrapper, and links each file opened for reading through `Recorder::linkSource()`, the hook `BladeEdges` uses. Includes are skipped, because coverage already records executed files, and so are write-only opens. `pestphp/pest-plugin-mutate` overrides `file://` the same way (`Pest\Mutate\Support\StreamWrapper`). If another wrapper already owns `file://` (such as `dg/bypass-finals` or Patchwork), it opens through that wrapper with the original flags, including the include flag, and registers it again after the test.
 - `src/Plugins/Tia/Recorder.php`: starts the capture in `beginTest()`, stops it in `endTest()` and `reset()`, and adds `linkRead()`, which keeps only project files through the existing `SourceScope`. `vendor/`, `storage/framework` and root dotfiles such as `.env` are never linked.
 
 On this skeleton the patch adds exactly one graph edge: `tests/Feature/ConventionsTest.php -> resources/views/welcome.blade.php`. With 500 extra tests that each render `/` and read a config file, recording (`--tia --fresh`) took 28.7–29.7 s against 27.0–28.1 s on stock Pest, about 4% more. Plain runs are unaffected, because the wrapper is only registered while TIA records.
 
-Known gaps: directory listings (`scandir`, `glob`) are not captured, and the wrapper would have to chain with mutate's when `--mutate` and `--tia` run together.
+Known gaps: directory listings (`scandir`, `glob`) are not captured. While a test records, a failed open (such as `file_get_contents()` of a missing file) raises two warnings instead of one; mutate's wrapper does the same.
 
 ## Notes
 
